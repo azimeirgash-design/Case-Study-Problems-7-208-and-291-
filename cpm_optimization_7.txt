@@ -1,0 +1,472 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+# ---------------------- CPM FUNCTION ----------------------
+def CPM_fun(df, selection, indirect_cost_per_day=1500):
+    """
+    Calculate project duration and cost using CPM for a selected option of each activity.
+    
+    """
+    Dv = len(df)
+
+    # ----------------- Build Dependencies -----------------
+    dep = {}
+    for idx, pred in enumerate(df['Predecessor']):
+        if pd.notna(pred) and str(pred).strip() and str(pred).strip() != 'nan' and str(pred).strip() != 'None':
+            pred_str = str(pred).strip()
+            if ',' in pred_str:
+                deps = [f"Task {int(p.strip())}" for p in pred_str.split(',') if p.strip()]
+            elif ' ' in pred_str:
+                deps = [f"Task {int(p.strip())}" for p in pred_str.split() if p.strip()]
+            else:
+                try:
+                    deps = [f"Task {int(float(pred_str))}"]
+                except:
+                    deps = []
+            dep[f"Task {idx+1}"] = deps
+        else:
+            dep[f"Task {idx+1}"] = []
+
+    # ----------------- Task Data -----------------
+    time_cols = sorted([col for col in df.columns if 'Duration' in str(col) or 'Time' in str(col)])
+    cost_cols = sorted([col for col in df.columns if 'Cost' in str(col)])
+
+    task_data = {}
+    for idx in range(Dv):
+        sel_idx = int(selection[idx])
+        available_times = [df[col].iloc[idx] for col in time_cols if pd.notna(df[col].iloc[idx])]
+        available_costs = [df[col].iloc[idx] for col in cost_cols if pd.notna(df[col].iloc[idx])]
+
+        sel_idx = min(sel_idx, len(available_times)-1)  # safety check
+        task_data[f"Task {idx+1}"] = {
+            'Duration': float(available_times[sel_idx]),
+            'Cost': float(available_costs[sel_idx])
+        }
+
+    # ----------------- Forward Pass (ES/EF) -----------------
+    es_ef = {}
+    for task_id in dep:
+        if dep[task_id]:
+            pred_efs = []
+            for pred in dep[task_id]:
+                if pred in es_ef:
+                    pred_efs.append(es_ef[pred]['EF'])
+            es_ef[task_id] = {'ES': max(pred_efs) if pred_efs else 0, 'EF': 0}
+        else:
+            es_ef[task_id] = {'ES': 0, 'EF': 0}
+        es_ef[task_id]['EF'] = es_ef[task_id]['ES'] + task_data[task_id]['Duration']
+
+    project_duration = max([info['EF'] for info in es_ef.values()])
+    total_direct_cost = sum([info['Cost'] for info in task_data.values()])
+    total_cost = total_direct_cost + indirect_cost_per_day * project_duration
+
+    return project_duration, total_cost
+
+# ---------------------- FAST NON-DOMINATED SORT ----------------------
+def fast_non_dominated_sort(F):
+    N = len(F)
+    if N == 0: return [[]]
+    if N == 1: return [[0]]
+
+    domination_count = np.zeros(N, dtype=int)
+    dominated_solutions = [[] for _ in range(N)]
+    fronts = []
+
+    for p in range(N):
+        for q in range(N):
+            if p == q: continue
+            p_dominates_q = all(F[p] <= F[q]) and any(F[p] < F[q])
+            q_dominates_p = all(F[q] <= F[p]) and any(F[q] < F[p])
+            if p_dominates_q:
+                dominated_solutions[p].append(q)
+            elif q_dominates_p:
+                domination_count[p] += 1
+        if domination_count[p] == 0:
+            if not fronts: fronts.append([p])
+            else: fronts[0].append(p)
+
+    i = 0
+    while i < len(fronts) and fronts[i]:
+        next_front = []
+        for p in fronts[i]:
+            for q in dominated_solutions[p]:
+                domination_count[q] -= 1
+                if domination_count[q] == 0 and q not in next_front:
+                    next_front.append(q)
+        i += 1
+        if next_front: fronts.append(next_front)
+    return fronts
+
+# ---------------------- CROWDING DISTANCE ----------------------
+def crowding_distance(F, front):
+    if len(front) <= 2:
+        return [float('inf')] * len(front)
+
+    distances = np.zeros(len(front))
+    m = F.shape[1]
+
+    for obj in range(m):
+        front_sorted = sorted(front, key=lambda x: F[x][obj])
+        obj_values = [F[idx][obj] for idx in front_sorted]
+        min_val, max_val = min(obj_values), max(obj_values)
+        if max_val - min_val > 1e-10:
+            distances[front.index(front_sorted[0])] = float('inf')
+            distances[front.index(front_sorted[-1])] = float('inf')
+            for i in range(1, len(front_sorted)-1):
+                distances[front.index(front_sorted[i])] += \
+                    (obj_values[i+1] - obj_values[i-1]) / (max_val - min_val)
+    return distances
+
+# ---------------------- SELECTION ----------------------
+def select_best_population(combined_P, combined_F, population_size):
+    fronts = fast_non_dominated_sort(combined_F)
+    new_indices = []
+    for front in fronts:
+        if len(new_indices) + len(front) <= population_size:
+            new_indices.extend(front)
+        else:
+            remaining = population_size - len(new_indices)
+            if remaining > 0:
+                distances = crowding_distance(combined_F, front)
+                front_with_dist = list(zip(front, distances))
+                front_with_dist.sort(key=lambda x: x[1], reverse=True)
+                new_indices.extend([idx for idx, _ in front_with_dist[:remaining]])
+            break
+    return combined_P[new_indices] if new_indices else combined_P[:population_size]
+
+# ---------------------- POPULATION EVALUATION ----------------------
+def evaluate(Pop, df):
+    return np.array([CPM_fun(df, sol) for sol in Pop])
+
+# ---------------------- LOAD DATA FROM EXCEL ----------------------
+def load_data_from_excel(filename):
+    """
+    Load project data from Excel file
+    
+    """
+    try:
+        # Try different possible filenames
+        possible_names = [filename, f"{filename}.xlsx", f"{filename}.xls",
+                         filename.replace('/CPM__7_activities', '.xlsx'), filename.replace('.cpm', '.xls')]
+
+        df = None
+        for name in possible_names:
+            if os.path.exists(name):
+                print(f"✓ Found file: {name}")
+                if name.endswith('.xlsx') or name.endswith('.xls'):
+                    df = pd.read_excel(name)
+                else:
+                    # Try reading as CSV if it's a text file
+                    df = pd.read_csv(name, sep=None, engine='python')
+                break
+
+        if df is None:
+            raise FileNotFoundError(f"Could not find file: {filename} or any variation")
+
+        # Clean up column names
+        df.columns = df.columns.str.strip()
+
+        # Identify Task column (might be named differently)
+        task_col = None
+        for col in df.columns:
+            if 'task' in col.lower() or col == 'Task' or col == 'Activity':
+                task_col = col
+                break
+        if task_col is None:
+            task_col = df.columns[0]  # Assume first column is Task
+
+        # Identify Predecessor column
+        pred_col = None
+        for col in df.columns:
+            if 'predecessor' in col.lower() or 'pred' in col.lower():
+                pred_col = col
+                break
+
+        # Rename columns for consistency
+        if task_col != 'Task':
+            df.rename(columns={task_col: 'Task'}, inplace=True)
+        if pred_col and pred_col != 'Predecessor':
+            df.rename(columns={pred_col: 'Predecessor'}, inplace=True)
+
+        # Ensure Predecessor column exists
+        if 'Predecessor' not in df.columns:
+            df['Predecessor'] = None
+
+        print(f"✓ Loaded {len(df)} activities")
+        print(f"  Columns: {list(df.columns)}")
+
+        # Count options per task
+        duration_cols = [col for col in df.columns if 'duration' in col.lower() or 'time' in col.lower()]
+        option_counts = []
+        for idx in range(len(df)):
+            count = 0
+            for col in duration_cols:
+                if pd.notna(df[col].iloc[idx]):
+                    count += 1
+            option_counts.append(max(1, count))
+
+        print(f"  Duration options available: {min(option_counts)} to {max(option_counts)} per task")
+
+        return df, option_counts
+
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        print("\nPlease ensure your Excel file has the following format:")
+        print("  - Column 'Task' (or first column): Activity numbers 1 to 7")
+        print("  - Column 'Predecessor': Predecessor relationships (e.g., '1' or '2,3')")
+        print("  - Columns 'Duration1', 'Duration2', ..., 'Duration6'")
+        print("  - Columns 'Cost1', 'Cost2', ..., 'Cost6'")
+        raise
+
+# ---------------------- MAIN EXECUTION ----------------------
+print("="*70)
+print("GROL-JAYA OPTIMIZATION FOR 7-ACTIVITY PROJECT")
+print("="*70)
+print("\n📂 Loading data from Excel file...")
+
+# Load data from Excel file - CHANGED TO CPM__7_activities
+filename = "CPM__7_activities"
+df, option_counts = load_data_from_excel(filename)
+
+Dv = len(df)
+print(f"\n📊 Project Statistics:")
+print(f"  • Total activities: {Dv}")
+print(f"  • Average options per activity: {np.mean(option_counts):.1f}")
+print(f"  • Total possible combinations: ~10^{np.sum(np.log10(option_counts)):.0f}")
+
+# ---------------------- GROL-JAYA PARAMETERS ----------------------
+Pn = 50  # Population size
+Max_iter = 10  # Number of generations
+phi_golden = 0.681
+jump_probability = 0.3
+
+# ---------------------- INITIALIZATION ----------------------
+np.random.seed(42)
+P = np.zeros((Pn, Dv), dtype=int)
+for i in range(Pn):
+    for j in range(Dv):
+        P[i,j] = np.random.randint(0, option_counts[j])
+
+generation_results = []
+
+print("\n" + "="*70)
+print("OPTIMIZATION IN PROGRESS")
+print("="*70)
+print(f"{'Gen':<6} {'Best Cost':<18} {'Best Duration':<15} {'Progress':<25}")
+print("="*70)
+
+# ---------------------- MAIN LOOP ----------------------
+for iteration in range(Max_iter):
+    F_current = evaluate(P, df)
+
+    # ---- Step 1: Golden Ratio Population Generation (GROL) ----
+    GROP = np.zeros_like(P)
+    for i in range(Pn):
+        for j in range(Dv):
+            r1, r2 = np.random.rand(), np.random.rand()
+            ub = option_counts[j]-1
+            if ub > 0:
+                val = P[i,j] + r1*(r2*((ub-P[i,j])-P[i,j]))
+                GROP[i,j] = int(np.clip(round(val), 0, ub))
+            else:
+                GROP[i,j] = P[i,j]
+
+    # ---- Combine and Select ----
+    combined_P = np.vstack((P, GROP))
+    combined_F = np.vstack((F_current, evaluate(GROP, df)))
+    P = select_best_population(combined_P, combined_F, Pn)
+
+    # ---- Step 2: Jaya algorithm Phase ----
+    F = evaluate(P, df)
+    fronts = fast_non_dominated_sort(F)
+    first_front = fronts[0] if fronts else list(range(Pn))
+    best_idx = first_front[np.argmin([F[i][0] for i in first_front])]
+    last_front = fronts[-1] if len(fronts) > 1 else first_front
+    worst_idx = last_front[np.argmax([F[i][0] for i in last_front])]
+
+    X_best, X_worst = P[best_idx].copy(), P[worst_idx].copy()
+    P_new = P.copy()
+    for i in range(Pn):
+        for j in range(Dv):
+            r1, r2 = np.random.rand(), np.random.rand()
+            ub = option_counts[j]-1
+            val = P[i,j] + r1*(X_best[j]-abs(P[i,j])) - r2*(X_worst[j]-abs(P[i,j]))
+            P_new[i,j] = int(round(np.clip(val, 0, ub)))
+
+    # ---- Step 3: Golden Ratio Jumping ----
+    GROP2 = P_new.copy()
+    for i in range(Pn):
+        for j in range(Dv):
+            if np.random.rand() < jump_probability:
+                r3, r4 = np.random.rand(), np.random.rand()
+                ub = option_counts[j]-1
+                val = P_new[i,j] + phi_golden*r3*(r4*(ub-P_new[i,j])-P_new[i,j])
+                GROP2[i,j] = int(np.clip(round(val), 0, ub))
+
+    # ---- Combine and Select ----
+    combined_P2 = np.vstack((P, GROP2))
+    combined_F2 = evaluate(combined_P2, df)
+    P = select_best_population(combined_P2, combined_F2, Pn)
+
+    # ---- Store Best Solution ----
+    final_F = evaluate(P, df)
+    final_fronts = fast_non_dominated_sort(final_F)
+    pareto_idx = final_fronts[0] if final_fronts else list(range(len(P)))
+    min_dur_idx = pareto_idx[np.argmin([final_F[i][0] for i in pareto_idx])]
+    best_duration, best_cost = final_F[min_dur_idx]
+
+    generation_results.append({
+        'generation': iteration+1,
+        'cost': best_cost,
+        'duration': best_duration,
+        'solution': P[min_dur_idx].copy()
+    })
+
+    # Progress bar
+    bar_length = 25
+    progress = (iteration + 1) / Max_iter
+    filled = int(bar_length * progress)
+    bar = '█' * filled + '░' * (bar_length - filled)
+
+    print(f"{iteration+1:<6} ${best_cost:<17,.0f} {best_duration:<15.1f} {bar} {progress*100:.0f}%")
+
+print("="*70)
+print("\n✅ OPTIMIZATION COMPLETED!\n")
+
+# ---------------------- FINAL PARETO FRONT ----------------------
+print("📈 Extracting Pareto-optimal solutions...")
+F_final = evaluate(P, df)
+fronts_final = fast_non_dominated_sort(F_final)
+pareto_indices = fronts_final[0] if fronts_final else list(range(len(P)))
+
+unique_solutions = {}
+for idx in pareto_indices:
+    key = tuple(P[idx])
+    if key not in unique_solutions:
+        unique_solutions[key] = F_final[idx]
+
+pareto_solutions = [(np.array(list(key)), val) for key, val in unique_solutions.items()]
+pareto_solutions.sort(key=lambda x: x[1][0])  # Sort by duration
+
+print(f"✓ Found {len(pareto_solutions)} unique Pareto-optimal solutions\n")
+
+# Display Pareto solutions (first 20 or all if less)
+num_to_show = min(20, len(pareto_solutions))
+print(f"{'Rank':<8} {'Duration (days)':<18} {'Total Cost ($)':<20} {'Options (first 5)':<25}")
+print("-"*80)
+for i in range(num_to_show):
+    sol, (dur, cost) = pareto_solutions[i]
+    opt_preview = ' '.join(map(str, sol[:5].astype(int))) + '...'
+    print(f"{i+1:<8} {dur:<18.1f} ${cost:<19,.0f} {opt_preview:<25}")
+
+if len(pareto_solutions) > 20:
+    print(f"... and {len(pareto_solutions) - 20} more solutions")
+
+# ---------------------- BEST SOLUTIONS ----------------------
+min_dur_idx = np.argmin([s[1][0] for s in pareto_solutions])
+min_cost_idx = np.argmin([s[1][1] for s in pareto_solutions])
+
+print("\n" + "="*70)
+print("🏆 OPTIMAL SOLUTIONS")
+print("="*70)
+
+print("\n⚡ FASTEST PROJECT (Minimum Duration):")
+print(f"   • Duration: {pareto_solutions[min_dur_idx][1][0]:.1f} days")
+print(f"   • Total Cost: ${pareto_solutions[min_dur_idx][1][1]:,.0f}")
+print(f"   • Direct Cost: ${pareto_solutions[min_dur_idx][1][1] - 1500 * pareto_solutions[min_dur_idx][1][0]:,.0f}")
+print(f"   • Indirect Cost: ${1500 * pareto_solutions[min_dur_idx][1][0]:,.0f}")
+
+print("\n💰 CHEAPEST PROJECT (Minimum Cost):")
+print(f"   • Duration: {pareto_solutions[min_cost_idx][1][0]:.1f} days")
+print(f"   • Total Cost: ${pareto_solutions[min_cost_idx][1][1]:,.0f}")
+print(f"   • Direct Cost: ${pareto_solutions[min_cost_idx][1][1] - 1500 * pareto_solutions[min_cost_idx][1][0]:,.0f}")
+print(f"   • Indirect Cost: ${1500 * pareto_solutions[min_cost_idx][1][0]:,.0f}")
+
+print("\n⚖️ TRADE-OFF RATIO:")
+duration_diff = pareto_solutions[min_dur_idx][1][0] - pareto_solutions[min_cost_idx][1][0]
+cost_diff = pareto_solutions[min_cost_idx][1][1] - pareto_solutions[min_dur_idx][1][1]
+if duration_diff != 0:
+    trade_off = cost_diff / duration_diff
+    print(f"   • Saving ${trade_off:,.0f} per day of delay")
+    print(f"   • Or costing ${-trade_off:,.0f} per day saved")
+
+# ---------------------- VISUALIZATION ----------------------
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle(f'GROL-JAYA Optimization - 7 Activity Project\n(Population: {Pn}, Generations: {Max_iter})',
+             fontsize=14, fontweight='bold')
+
+# Plot 1: Generation Progress
+ax1 = axes[0]
+gens = [r['generation'] for r in generation_results]
+costs_gen = [r['cost'] for r in generation_results]
+durations_gen = [r['duration'] for r in generation_results]
+
+ax1.plot(gens, costs_gen, 'b-o', linewidth=2, markersize=4, label='Best Cost')
+ax1.set_xlabel('Generation', fontsize=11)
+ax1.set_ylabel('Cost ($)', color='b', fontsize=11)
+ax1.tick_params(axis='y', labelcolor='b')
+ax1.grid(True, alpha=0.3)
+
+ax1_twin = ax1.twinx()
+ax1_twin.plot(gens, durations_gen, 'r-o', linewidth=2, markersize=4, label='Best Duration')
+ax1_twin.set_ylabel('Duration (days)', color='r', fontsize=11)
+ax1_twin.tick_params(axis='y', labelcolor='r')
+
+# Add legend
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax1_twin.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+ax1.set_title('Optimization Progress Over Generations', fontsize=12)
+
+# Plot 2: Pareto Front
+ax2 = axes[1]
+all_durs = [s[1][0] for s in pareto_solutions]
+all_costs = [s[1][1] for s in pareto_solutions]
+
+ax2.scatter(all_durs, all_costs, c='red', s=60, alpha=0.6, edgecolors='black', zorder=5, label='Pareto Solutions')
+ax2.plot(all_durs, all_costs, 'b-', alpha=0.5, linewidth=2, zorder=3, label='Pareto Front')
+ax2.scatter(all_durs[min_dur_idx], all_costs[min_dur_idx], c='green', s=250,
+           marker='*', label='Fastest Project', edgecolors='black', linewidth=2, zorder=6)
+ax2.scatter(all_durs[min_cost_idx], all_costs[min_cost_idx], c='gold', s=250,
+           marker='D', label='Cheapest Project', edgecolors='black', linewidth=2, zorder=6)
+
+ax2.set_xlabel('Project Duration (days)', fontsize=11)
+ax2.set_ylabel('Total Project Cost ($)', fontsize=11)
+ax2.set_title(f'Pareto Front - Duration vs Cost\n({len(pareto_solutions)} Non-dominated Solutions)', fontsize=12)
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc='best')
+
+# Format y-axis to show $ in millions
+ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
+ax2.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}d'))
+
+plt.tight_layout()
+plt.savefig('grol_nsjaya_7_activities.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\n📊 Results saved as 'grol_nsjaya_7_activities.png'")
+
+# Save Pareto solutions to CSV
+pareto_df = pd.DataFrame([
+    {'Rank': i+1, 'Duration': dur, 'Total_Cost': cost,
+     'Direct_Cost': cost - 1500 * dur,
+     'Indirect_Cost': 1500 * dur,
+     'Solution_Options': str(sol.astype(int).tolist())}
+    for i, (sol, (dur, cost)) in enumerate(pareto_solutions)
+])
+pareto_df.to_csv('pareto_solutions_7_activities.csv', index=False)
+print("📊 Pareto solutions saved to 'pareto_solutions_7_activities.csv'")
+
+# Save generation history
+history_df = pd.DataFrame(generation_results)
+history_df.to_csv('optimization_history_7_activities.csv', index=False)
+print("📊 Optimization history saved to 'optimization_history_7_activities.csv'")
+
+print("\n" + "="*70)
+print("✅ ANALYSIS COMPLETE")
+print("="*70)
